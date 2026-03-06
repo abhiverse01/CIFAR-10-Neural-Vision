@@ -1,8 +1,8 @@
 # CIFAR-10 Neural Vision — Requirements
 # Install: pip install -r requirements.txt
 
-torch==2.3.1
-torchvision==0.18.1
+torch==2.10.0
+torchvision==0.21.0
 numpy==1.26.4
 Pillow==10.3.0
 matplotlib==3.8.4
