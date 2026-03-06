@@ -1,189 +1,141 @@
 """
-model_builder.py
-CNN architecture for CIFAR-10 classification.
-Features: Residual blocks, data augmentation, cosine LR decay, label smoothing.
+model_builder.py  —  PyTorch rewrite
+ResNet-style CNN for CIFAR-10, dual binary + multi-class.
+Run: python models/model_builder.py
 """
 
-import tensorflow as tf
-from tensorflow.keras import layers, models, regularizers
-import numpy as np
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import torchvision
+import torchvision.transforms as transforms
 
-
-# ─── Constants ────────────────────────────────────────────────────────────────
 CLASS_NAMES = [
-    "✈ airplane", "🚗 automobile", "🐦 bird", "🐱 cat", "🦌 deer",
-    "🐶 dog", "🐸 frog", "🐴 horse", "🚢 ship", "🚚 truck"
-]
-CLASS_NAMES_CLEAN = [
     "airplane", "automobile", "bird", "cat", "deer",
     "dog", "frog", "horse", "ship", "truck"
 ]
-BINARY_CLASSES = {0: "✈ Airplane (Class A)", "other": "🚗 Non-Airplane (Class B)"}
-IMG_SIZE = (32, 32)
-NUM_CLASSES = 10
+CLASS_EMOJIS = ["✈️", "🚗", "🐦", "🐱", "🦌", "🐶", "🐸", "🐴", "🚢", "🚚"]
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-# ─── Data Augmentation Pipeline ───────────────────────────────────────────────
-def get_augmentation_layer():
-    return tf.keras.Sequential([
-        layers.RandomFlip("horizontal"),
-        layers.RandomRotation(0.1),
-        layers.RandomZoom(0.1),
-        layers.RandomTranslation(0.1, 0.1),
-        layers.RandomContrast(0.1),
-    ], name="augmentation")
+class ResBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, stride, 1, bias=False),
+            nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
+        )
+        self.skip = nn.Sequential()
+        if stride != 1 or in_ch != out_ch:
+            self.skip = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, 1, stride, bias=False),
+                nn.BatchNorm2d(out_ch),
+            )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        return self.relu(self.conv(x) + self.skip(x))
 
 
-# ─── Residual Block ───────────────────────────────────────────────────────────
-def residual_block(x, filters, stride=1, l2=1e-4):
-    shortcut = x
+class MultiClassCNN(nn.Module):
+    def __init__(self, num_classes=10):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 64, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+        )
+        self.layer1 = nn.Sequential(ResBlock(64, 64), ResBlock(64, 64))
+        self.layer2 = nn.Sequential(ResBlock(64, 128, 2), ResBlock(128, 128))
+        self.layer3 = nn.Sequential(ResBlock(128, 256, 2), ResBlock(256, 256))
+        self.layer4 = nn.Sequential(ResBlock(256, 512, 2), ResBlock(512, 512))
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1), nn.Flatten(),
+            nn.Dropout(0.4), nn.Linear(512, num_classes),
+        )
 
-    x = layers.Conv2D(filters, 3, stride, padding="same",
-                      kernel_regularizer=regularizers.l2(l2), use_bias=False)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Activation("relu")(x)
-
-    x = layers.Conv2D(filters, 3, 1, padding="same",
-                      kernel_regularizer=regularizers.l2(l2), use_bias=False)(x)
-    x = layers.BatchNormalization()(x)
-
-    # Project shortcut if dimensions change
-    if stride != 1 or shortcut.shape[-1] != filters:
-        shortcut = layers.Conv2D(filters, 1, stride, padding="same",
-                                 kernel_regularizer=regularizers.l2(l2), use_bias=False)(shortcut)
-        shortcut = layers.BatchNormalization()(shortcut)
-
-    x = layers.Add()([x, shortcut])
-    x = layers.Activation("relu")(x)
-    return x
+    def forward(self, x):
+        return self.head(self.layer4(self.layer3(self.layer2(self.layer1(self.stem(x))))))
 
 
-# ─── Multi-Class Model (ResNet-style) ─────────────────────────────────────────
-def create_multiclass_model(use_augmentation=True):
-    inputs = layers.Input(shape=(32, 32, 3), name="input")
-    x = inputs
+class BinaryCNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(3, 64, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            ResBlock(64, 64),
+            ResBlock(64, 128, 2),
+            ResBlock(128, 256, 2),
+            ResBlock(256, 512, 2),
+            nn.AdaptiveAvgPool2d(1), nn.Flatten(),
+            nn.Dropout(0.4), nn.Linear(512, 128),
+            nn.ReLU(inplace=True), nn.Dropout(0.3),
+            nn.Linear(128, 1),
+        )
 
-    if use_augmentation:
-        x = get_augmentation_layer()(x)
-
-    # Stem
-    x = layers.Conv2D(64, 3, padding="same", use_bias=False,
-                      kernel_regularizer=regularizers.l2(1e-4))(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Activation("relu")(x)
-
-    # Residual stages
-    x = residual_block(x, 64)
-    x = residual_block(x, 64)
-    x = residual_block(x, 128, stride=2)
-    x = residual_block(x, 128)
-    x = residual_block(x, 256, stride=2)
-    x = residual_block(x, 256)
-    x = residual_block(x, 512, stride=2)
-    x = residual_block(x, 512)
-
-    # Head
-    x = layers.GlobalAveragePooling2D()(x)
-    x = layers.Dropout(0.4)(x)
-    outputs = layers.Dense(NUM_CLASSES, activation="softmax", name="multiclass_out")(x)
-
-    model = models.Model(inputs, outputs, name="ResNet_MultiClass")
-    return model
+    def forward(self, x):
+        return self.net(x)
 
 
-# ─── Binary Model (airplane vs rest) ──────────────────────────────────────────
-def create_binary_model(use_augmentation=True):
-    inputs = layers.Input(shape=(32, 32, 3), name="input")
-    x = inputs
-
-    if use_augmentation:
-        x = get_augmentation_layer()(x)
-
-    # Stem
-    x = layers.Conv2D(64, 3, padding="same", use_bias=False,
-                      kernel_regularizer=regularizers.l2(1e-4))(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Activation("relu")(x)
-
-    # Residual stages
-    x = residual_block(x, 64)
-    x = residual_block(x, 128, stride=2)
-    x = residual_block(x, 256, stride=2)
-    x = residual_block(x, 512, stride=2)
-
-    # Head
-    x = layers.GlobalAveragePooling2D()(x)
-    x = layers.Dropout(0.4)(x)
-    x = layers.Dense(128, activation="relu")(x)
-    x = layers.Dropout(0.3)(x)
-    outputs = layers.Dense(1, activation="sigmoid", name="binary_out")(x)
-
-    model = models.Model(inputs, outputs, name="ResNet_Binary")
-    return model
-
-
-# ─── Learning Rate Schedule ───────────────────────────────────────────────────
-def cosine_annealing_schedule(epoch, lr, total_epochs=30, min_lr=1e-6, max_lr=1e-3):
-    """Cosine annealing with warm restarts."""
-    return min_lr + 0.5 * (max_lr - min_lr) * (1 + np.cos(np.pi * epoch / total_epochs))
-
-
-# ─── Training Function ────────────────────────────────────────────────────────
 def train_models(epochs=30, batch_size=128, save_dir="models/"):
-    import os
+    os.makedirs(save_dir, exist_ok=True)
+    train_tf = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomCrop(32, padding=4),
+        transforms.ColorJitter(0.2, 0.2, 0.2),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ])
+    test_tf = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ])
+    train_ds = torchvision.datasets.CIFAR10("data/", train=True,  download=True, transform=train_tf)
+    test_ds  = torchvision.datasets.CIFAR10("data/", train=False, download=True, transform=test_tf)
+    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=2)
+    test_dl  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, num_workers=2)
 
-    print("📦 Loading CIFAR-10 dataset...")
-    (x_train, y_train), (x_test, y_test) = tf.keras.datasets.cifar10.load_data()
-    x_train = x_train.astype("float32") / 255.0
-    x_test = x_test.astype("float32") / 255.0
+    def run(model, criterion, name, label_fn=None):
+        model = model.to(DEVICE)
+        opt = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+        sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+        best_acc, best_state = 0.0, None
+        for ep in range(epochs):
+            model.train()
+            for imgs, labels in train_dl:
+                imgs = imgs.to(DEVICE)
+                tgt = label_fn(labels).to(DEVICE) if label_fn else labels.to(DEVICE)
+                opt.zero_grad()
+                criterion(model(imgs).squeeze(), tgt).backward()
+                opt.step()
+            sched.step()
+            model.eval(); correct = total = 0
+            with torch.no_grad():
+                for imgs, labels in test_dl:
+                    imgs = imgs.to(DEVICE)
+                    tgt = label_fn(labels).to(DEVICE) if label_fn else labels.to(DEVICE)
+                    out = model(imgs)
+                    if label_fn:
+                        correct += ((torch.sigmoid(out.squeeze()) > 0.5).long() == tgt.long()).sum().item()
+                    else:
+                        correct += (out.argmax(1) == tgt).sum().item()
+                    total += tgt.size(0)
+            acc = correct / total
+            print(f"  [{name}] Ep {ep+1}/{epochs} val_acc={acc:.4f}")
+            if acc > best_acc:
+                best_acc, best_state = acc, {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        model.load_state_dict(best_state)
+        torch.save(model.state_dict(), os.path.join(save_dir, f"model_{name}.pt"))
+        print(f"  Saved model_{name}.pt  (best={best_acc:.4f})")
 
-    callbacks = [
-        tf.keras.callbacks.EarlyStopping(monitor="val_accuracy", patience=8, restore_best_weights=True),
-        tf.keras.callbacks.LearningRateScheduler(
-            lambda e, lr: cosine_annealing_schedule(e, lr, total_epochs=epochs)
-        ),
-        tf.keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=4),
-    ]
-
-    # ── Multi-class ──
-    print("\n🚀 Training Multi-Class Model...")
-    mc_model = create_multiclass_model()
-    mc_model.compile(
-        optimizer=tf.keras.optimizers.AdamW(learning_rate=1e-3, weight_decay=1e-4),
-        loss=tf.keras.losses.SparseCategoricalCrossentropy(label_smoothing=0.1),
-        metrics=["accuracy"]
-    )
-    mc_history = mc_model.fit(
-        x_train, y_train,
-        epochs=epochs, batch_size=batch_size,
-        validation_data=(x_test, y_test),
-        callbacks=callbacks, verbose=1
-    )
-    mc_model.save(os.path.join(save_dir, "model_multiclass.keras"))
-    print(f"✅ Multi-class model saved. Best val accuracy: {max(mc_history.history['val_accuracy']):.4f}")
-
-    # ── Binary ──
-    print("\n🚀 Training Binary Model (Airplane vs Rest)...")
-    y_train_binary = (y_train == 0).astype("float32")
-    y_test_binary = (y_test == 0).astype("float32")
-
-    bin_model = create_binary_model()
-    bin_model.compile(
-        optimizer=tf.keras.optimizers.AdamW(learning_rate=1e-3, weight_decay=1e-4),
-        loss="binary_crossentropy",
-        metrics=["accuracy", tf.keras.metrics.AUC(name="auc")]
-    )
-    bin_history = bin_model.fit(
-        x_train, y_train_binary,
-        epochs=epochs, batch_size=batch_size,
-        validation_data=(x_test, y_test_binary),
-        callbacks=callbacks, verbose=1
-    )
-    bin_model.save(os.path.join(save_dir, "model_binary.keras"))
-    print(f"✅ Binary model saved. Best val AUC: {max(bin_history.history['val_auc']):.4f}")
-
-    return mc_history, bin_history
+    print("🚀 Multi-Class..."); run(MultiClassCNN(), nn.CrossEntropyLoss(label_smoothing=0.1), "multiclass")
+    print("🚀 Binary...");      run(BinaryCNN(), nn.BCEWithLogitsLoss(), "binary", lambda y: (y==0).float())
 
 
 if __name__ == "__main__":
+    print(f"Device: {DEVICE}")
     train_models()
