@@ -4,8 +4,8 @@
 
 torch==2.10.0
 torchvision==0.25.0
-numpy==1.26.4
-Pillow==10.3.0
-matplotlib==3.8.4
-pandas==2.2.2
+numpy==2.2.3
+Pillow==11.1.0
+matplotlib==3.10.1
+pandas==2.2.3
 streamlit==1.35.0
